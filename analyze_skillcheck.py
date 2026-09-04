@@ -45,10 +45,34 @@ def events(path):
         t = parse_ass_time(z[1])
         if t is None:
             continue
-        k = re.search(r"(LMB_DOWN|LMB_UP|SPACE_DOWN|SPACE_UP)", z[9])
+        k = re.search(r"(LMB_DOWN|LMB_UP|SPACE_DOWN|SPACE_UP|LABEL_WHITE|LABEL_BLACK)", z[9])
         if k:
             out.append((t, k.group(1)))
     return sorted(out)
+
+
+def associate_labels(ev):
+    checks = []
+    pending = []
+    orphans = []
+    for t, kind in ev:
+        if kind == "SPACE_DOWN":
+            pending.append({"space_time": t})
+        elif kind in {"LABEL_WHITE", "LABEL_BLACK"}:
+            if pending:
+                check = pending.pop(0)
+                check["label"] = "WHITE" if kind == "LABEL_WHITE" else "BLACK"
+                check["label_time"] = t
+                check["label_delay"] = t - check["space_time"]
+                checks.append(check)
+            else:
+                orphans.append({"time": t, "label": "WHITE" if kind == "LABEL_WHITE" else "BLACK"})
+    checks_by_time = {x["space_time"]: x for x in checks}
+    result = []
+    for t, kind in ev:
+        if kind == "SPACE_DOWN":
+            result.append(checks_by_time.get(t, {"space_time": t, "label": None, "label_time": None, "label_delay": None}))
+    return result, orphans
 
 
 def probe(path):
@@ -58,17 +82,8 @@ def probe(path):
 
 def hough(frame):
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    variants = [
-        cv2.GaussianBlur(gray, (5, 5), 1.0),
-        cv2.GaussianBlur(gray, (7, 7), 1.5),
-        cv2.GaussianBlur(gray, (9, 9), 2.0),
-        cv2.medianBlur(gray, 5),
-    ]
-    params = (
-        (1.00, 80, 20), (1.05, 85, 21), (1.10, 90, 22),
-        (1.15, 90, 23), (1.20, 100, 25), (1.25, 105, 27),
-        (1.30, 110, 28), (1.35, 115, 30), (1.40, 120, 31),
-    )
+    variants = [cv2.GaussianBlur(gray, (5, 5), 1.0), cv2.GaussianBlur(gray, (7, 7), 1.5), cv2.GaussianBlur(gray, (9, 9), 2.0), cv2.medianBlur(gray, 5)]
+    params = ((1.00, 80, 20), (1.05, 85, 21), (1.10, 90, 22), (1.15, 90, 23), (1.20, 100, 25), (1.25, 105, 27), (1.30, 110, 28), (1.35, 115, 30), (1.40, 120, 31))
     out = []
     for g in variants:
         for dp, p1, p2 in params:
@@ -96,10 +111,8 @@ def ring_features(frame, cx, cy, r, bins=180):
     ang = (np.arctan2(-(yy - cy), xx - cx) + 2 * np.pi) % (2 * np.pi)
     bi = (ang[keep] * bins / (2 * np.pi)).astype(np.int32)
     n = np.bincount(bi, minlength=bins)
-
     def hist(values):
         return np.bincount(bi, weights=values[keep], minlength=bins) / np.maximum(n, 1)
-
     vv = v[keep]
     ss = s[keep]
     v20, v35, _, v65, v80 = np.percentile(vv, [20, 35, 50, 65, 80])
@@ -274,12 +287,13 @@ def merge_reports(session_report):
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         all_path = Path(REPORT_ALL)
-        merged = {"version": 2, "sessions": []}
+        merged = {"version": 3, "sessions": []}
         if all_path.exists():
             try:
                 old = json.loads(all_path.read_text(encoding="utf-8"))
                 if isinstance(old, dict) and isinstance(old.get("sessions"), list):
                     merged = old
+                merged["version"] = 3
             except Exception:
                 pass
         merged["sessions"].append(session_report)
@@ -292,9 +306,8 @@ def merge_reports(session_report):
             except Exception:
                 pass
         write_atomic_json(all_path, merged)
-        if session_report.get("file"):
-            per_session = Path(session_report["file"])
-            per_session.unlink(missing_ok=True)
+        if session_report.get("report_file"):
+            Path(session_report["report_file"]).unlink(missing_ok=True)
         print(f"JSON: объединено в {REPORT_ALL}, строк={line_count(all_path)}")
         if line_count(all_path) > REPORT_LIMIT_LINES:
             print(f"JSON: предупреждение — {REPORT_ALL} больше {REPORT_LIMIT_LINES} строк")
@@ -317,25 +330,40 @@ def main():
     print(f"Видео: {meta['width']}x{meta['height']} fps={meta['r_frame_rate']}")
     ev = events(path)
     spaces = [t for t, k in ev if k == "SPACE_DOWN"]
+    labels, orphans = associate_labels(ev)
     print(f"SPACE: {len(spaces)}")
     print("SPACE times: " + ", ".join(f"{t:.3f}" for t in spaces))
+    print("LABELS: " + (", ".join(f"{x['label']}@{x['label_time']:.3f}" for x in labels if x.get("label")) or "нет"))
+    if orphans:
+        print("ORPHAN LABELS: " + ", ".join(f"{x['label']}@{x['time']:.3f}" for x in orphans))
     print(f"Анализ: {args.sample_fps:g} FPS, каждый кадр, 36 Hough-проходов, adaptive HSV, random center")
     cap = cv2.VideoCapture(path)
     checks = []
     for i, space in enumerate(spaces, 1):
         rows = local_check(cap, float(eval_fraction(meta["r_frame_rate"])), max(0, space - args.before), space + args.after, args.sample_fps)
         summary = summarize(rows, space)
+        label_info = labels[i - 1] if i - 1 < len(labels) else {"label": None, "label_time": None, "label_delay": None}
         summary["space"] = space
         summary["index"] = i
+        summary["ground_truth"] = label_info.get("label")
+        summary["label_time"] = label_info.get("label_time")
+        summary["label_delay"] = label_info.get("label_delay")
         checks.append({"summary": summary, "trajectory": rows})
-        print(f"#{i} SPACE={space:.3f} frames={len(rows)} -> {summary['result']}")
+        gt = summary["ground_truth"]
+        gt_text = f" LABEL={gt}" if gt else " LABEL=?"
+        match = "" if not gt else (" OK" if summary["result"] == gt else " MISS")
+        print(f"#{i} SPACE={space:.3f}{gt_text} frames={len(rows)} -> {summary['result']}{match}")
     cap.release()
-    report = {"file": path, "video": meta, "events": ev, "summary": {"checks": len(checks), "white": sum(x["summary"]["result"] == "WHITE" for x in checks), "black": sum(x["summary"]["result"] == "BLACK" for x in checks), "uncertain": sum(x["summary"]["result"] == "UNCERTAIN" for x in checks), "no_circle": sum(x["summary"]["result"] == "NO_CIRCLE" for x in checks)}, "checks": checks}
+    labeled = [x for x in checks if x["summary"].get("ground_truth") in {"WHITE", "BLACK"}]
+    correct = sum(x["summary"]["result"] == x["summary"]["ground_truth"] for x in labeled)
+    report = {"file": path, "video": meta, "events": ev, "label_association": labels, "orphan_labels": orphans, "summary": {"checks": len(checks), "white": sum(x["summary"]["result"] == "WHITE" for x in checks), "black": sum(x["summary"]["result"] == "BLACK" for x in checks), "uncertain": sum(x["summary"]["result"] == "UNCERTAIN" for x in checks), "no_circle": sum(x["summary"]["result"] == "NO_CIRCLE" for x in checks), "labeled": len(labeled), "correct_labeled": correct, "accuracy_labeled": (correct / len(labeled) if labeled else None)}, "checks": checks}
     report_name = Path(f"analysis_session_{Path(path).stem}.json")
     write_atomic_json(report_name, report)
-    session_report = {"file": path, "report_file": report_name.name, "summary": report["summary"], "space_times": spaces, "checks": checks}
+    session_report = {"file": path, "report_file": report_name.name, "summary": report["summary"], "space_times": spaces, "labels": labels, "orphan_labels": orphans, "checks": checks}
     merge_reports(session_report)
-    print(f"ИТОГ: Checks={len(checks)} WHITE={report['summary']['white']} BLACK={report['summary']['black']} UNCERTAIN={report['summary']['uncertain']} NO_CIRCLE={report['summary']['no_circle']}")
+    s = report["summary"]
+    acc = f" accuracy={s['accuracy_labeled']:.3f}" if s["accuracy_labeled"] is not None else ""
+    print(f"ИТОГ: Checks={len(checks)} WHITE={s['white']} BLACK={s['black']} UNCERTAIN={s['uncertain']} NO_CIRCLE={s['no_circle']} LABELED={s['labeled']} CORRECT={s['correct_labeled']}{acc}")
     print(f"===== КОНЕЦ АНАЛИЗА {path} =====")
 
 
