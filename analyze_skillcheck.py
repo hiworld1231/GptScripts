@@ -5,12 +5,15 @@ import math
 import os
 import re
 import subprocess
+import tempfile
+import fcntl
 
 import cv2
 import numpy as np
 
-REPORT_BASE = "analysis_report"
-REPORT_LIMIT = 500
+REPORT_LIMIT_LINES = 500
+REPORT_ALL = "analysis_all.json"
+MERGE_LOCK = ".analysis_merge.lock"
 
 
 def newest():
@@ -20,47 +23,13 @@ def newest():
     return max(files, key=lambda x: int(re.search(r"\d+", x).group()))
 
 
-def atomic_report(report):
-    raw = json.dumps(report, ensure_ascii=False, separators=(",", ":"))
-    chunks = []
-    pos = 0
-    while pos < len(raw):
-        lo, hi = 1, min(len(raw) - pos, REPORT_LIMIT)
-        best = 1
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            probe = json.dumps({"chunk": "", "data": raw[pos:pos + mid]}, ensure_ascii=False, separators=(",", ":"))
-            if len(probe) <= REPORT_LIMIT:
-                best = mid
-                lo = mid + 1
-            else:
-                hi = mid - 1
-        chunks.append(raw[pos:pos + best])
-        pos += best
-    total = len(chunks)
-    created = []
-    for index, data in enumerate(chunks):
-        n = 0
-        while True:
-            suffix = "" if n == 0 else f"_{n}"
-            name = f"{REPORT_BASE}{suffix}.json"
-            try:
-                fd = os.open(name, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-                payload = json.dumps({"chunk": index + 1, "chunks": total, "data": data}, ensure_ascii=False, separators=(",", ":"))
-                os.write(fd, payload.encode("utf-8"))
-                os.close(fd)
-                created.append(name)
-                break
-            except FileExistsError:
-                n += 1
-            except Exception:
-                try:
-                    os.close(fd)
-                except Exception:
-                    pass
-                raise
-    print(f"JSON: сохранено {total} частей, каждая <= {REPORT_LIMIT} символов")
-    return created
+def parse_ass_time(value):
+    m = re.match(r"^(\d+):(\d+):(\d+)[.:](\d+)$", value.strip())
+    if not m:
+        return None
+    h, mi, s, fraction = m.groups()
+    fraction = fraction[:3].ljust(3, "0")
+    return int(h) * 3600 + int(mi) * 60 + int(s) + int(fraction) / 1000.0
 
 
 def events(path):
@@ -72,12 +41,10 @@ def events(path):
         z = line.split(",", 9)
         if len(z) < 10:
             continue
-        m = re.match(r"(\d+):(\d+):(\d+)[.:](\d+)", z[1])
-        if not m:
+        t = parse_ass_time(z[1])
+        if t is None:
             continue
-        h, mi, s, cs = map(int, m.groups())
-        t = h * 3600 + mi * 60 + s + cs / 100
-        k = re.search(r"(LMB_DOWN|LMB_UP|SPACE_DOWN)", z[9])
+        k = re.search(r"(LMB_DOWN|LMB_UP|SPACE_DOWN|SPACE_UP)", z[9])
         if k:
             out.append((t, k.group(1)))
     return sorted(out)
@@ -134,11 +101,11 @@ def ring_features(frame, cx, cy, r, bins=180):
 
     vv = v[keep]
     ss = s[keep]
-    v20, v35, v50, v65, v80 = np.percentile(vv, [20, 35, 50, 65, 80])
-    s20, s50, s80 = np.percentile(ss, [20, 50, 80])
+    v20, v35, _, v65, v80 = np.percentile(vv, [20, 35, 50, 65, 80])
+    s20, _, s80 = np.percentile(ss, [20, 50, 80])
     white = np.clip((v - (v65 + 3)) / max(1, 255 - v65), 0, 1) * np.clip((s80 + 25 - s) / max(20, s80 + 25), 0, 1)
     black = np.clip((v35 - v) / max(20, v35 - v20 + 20), 0, 1) * (0.35 + 0.65 * np.clip((s + 15) / 100, 0, 1))
-    red = (np.minimum(np.abs(h - 0), np.abs(h - 180)) < 16).astype(np.float32) * np.clip((s - s20) / max(20, 100 - s20), 0, 1)
+    red = (np.minimum(np.abs(h), np.abs(h - 180)) < 16).astype(np.float32) * np.clip((s - s20) / max(20, 100 - s20), 0, 1)
     gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
     edge = np.hypot(gx, gy)
@@ -250,28 +217,41 @@ def fit_red(rows, space):
     return {"predicted_angle": predicted, "speed_deg_s": math.degrees(velocity), "fit_residual_deg": math.degrees(residual), "degree": degree, "points": len(good)}
 
 
+def angular_mean(values):
+    if not values:
+        return None
+    return float(np.angle(np.mean(np.exp(1j * np.array(values)))) % (2 * np.pi))
+
+
 def summarize(rows, space):
     if not rows:
         return {"result": "NO_CIRCLE", "frames": 0}
     before = [x for x in rows if x["t"] <= space + 0.03]
-    recent = before[-15:] if before else rows[-15:]
+    recent = before[-30:] if before else rows[-30:]
     red = fit_red(rows, space)
-    white_angle = float(np.angle(np.mean(np.exp(1j * np.array([x["white_angle"] for x in recent])))) % (2 * np.pi)) if recent else None
-    black_angle = float(np.angle(np.mean(np.exp(1j * np.array([x["black_angle"] for x in recent])))) % (2 * np.pi)) if recent else None
-    if red is not None:
-        wd = abs(math.degrees(circular_distance(red["predicted_angle"], white_angle))) if white_angle is not None else 999.0
-        bd = abs(math.degrees(circular_distance(red["predicted_angle"], black_angle))) if black_angle is not None else 999.0
-        if wd <= bd:
-            result = "WHITE"
-            target_distance = wd
+    white_angle = angular_mean([x["white_angle"] for x in recent])
+    black_angle = angular_mean([x["black_angle"] for x in recent])
+    white_strength = float(np.median([x["white_strength"] for x in recent]))
+    black_strength = float(np.median([x["black_strength"] for x in recent]))
+    if red is not None and white_angle is not None and black_angle is not None:
+        wd = abs(math.degrees(circular_distance(red["predicted_angle"], white_angle)))
+        bd = abs(math.degrees(circular_distance(red["predicted_angle"], black_angle)))
+        margin = abs(wd - bd)
+        if margin >= 8.0:
+            result = "WHITE" if wd < bd else "BLACK"
         else:
-            result = "BLACK"
-            target_distance = bd
+            result = "UNCERTAIN"
+        target_distance = min(wd, bd)
     else:
-        ws = float(np.mean([x["white_strength"] for x in recent]))
-        bs = float(np.mean([x["black_strength"] for x in recent]))
-        result = "WHITE" if ws >= bs else "BLACK"
+        ratio = white_strength / max(black_strength, 1e-6)
+        if ratio >= 1.35:
+            result = "WHITE"
+        elif ratio <= 0.74:
+            result = "BLACK"
+        else:
+            result = "UNCERTAIN"
         target_distance = None
+        wd = bd = None
     return {
         "result": result,
         "frames": len(rows),
@@ -281,9 +261,66 @@ def summarize(rows, space):
         "radius_mean": float(np.mean([x["r"] for x in rows])),
         "white_angle_deg": math.degrees(white_angle) if white_angle is not None else None,
         "black_angle_deg": math.degrees(black_angle) if black_angle is not None else None,
+        "white_strength": white_strength,
+        "black_strength": black_strength,
         "red_prediction": red,
+        "white_distance_deg": wd,
+        "black_distance_deg": bd,
         "target_distance_deg": target_distance,
     }
+
+
+def write_atomic_json(path, data):
+    fd, temp = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent), text=True)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp, path)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
+
+
+def line_count(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return sum(1 for _ in f)
+
+
+def merge_reports(session_report):
+    lock_fd = os.open(MERGE_LOCK, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        all_path = Path(REPORT_ALL)
+        merged = {"version": 2, "sessions": []}
+        if all_path.exists():
+            try:
+                old = json.loads(all_path.read_text(encoding="utf-8"))
+                if isinstance(old, dict) and isinstance(old.get("sessions"), list):
+                    merged = old
+            except Exception:
+                pass
+        merged["sessions"].append(session_report)
+        legacy = sorted(Path(".").glob("analysis_report*.json"))
+        for path in legacy:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                merged.setdefault("legacy_chunks", []).append({"file": path.name, "payload": payload})
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        write_atomic_json(all_path, merged)
+        if session_report.get("file"):
+            per_session = Path(session_report["file"])
+            per_session.unlink(missing_ok=True)
+        print(f"JSON: объединено в {REPORT_ALL}, строк={line_count(all_path)}")
+        if line_count(all_path) > REPORT_LIMIT_LINES:
+            print(f"JSON: предупреждение — {REPORT_ALL} больше {REPORT_LIMIT_LINES} строк")
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
 
 
 def main():
@@ -296,11 +333,13 @@ def main():
     ev = events(path)
     downs = [x[0] for x in ev if x[1] == "LMB_DOWN"]
     off = downs[0] if downs else 0.0
-    spaces = [max(0.0, x[0] - off) for x in ev if x[1] == "SPACE_DOWN"]
+    spaces = [x[0] - off for x in ev if x[1] == "SPACE_DOWN"]
+    spaces = [x for x in spaces if x >= 0]
     print(f"Файл: {path}")
     print(f"Видео: {info.get('width')}x{info.get('height')} fps={info.get('r_frame_rate')}")
     print(f"SPACE: {len(spaces)}")
-    print(f"Анализ: {args.sample_fps} FPS, каждый кадр, 36 Hough-проходов, adaptive HSV, random center, WHITE > BLACK")
+    print(f"SPACE times: {', '.join(f'{x:.3f}' for x in spaces)}")
+    print(f"Анализ: {args.sample_fps} FPS, каждый кадр, 36 Hough-проходов, adaptive HSV, random center")
     cap = cv2.VideoCapture(path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 60.0
     checks = []
@@ -318,21 +357,26 @@ def main():
             r = result["red_prediction"]
             print(f"   RED: angle={math.degrees(r['predicted_angle']) % 360:.1f} speed={r['speed_deg_s']:.1f}deg/s residual={r['fit_residual_deg']:.2f}deg")
         if result.get("target_distance_deg") is not None:
-            print(f"   TARGET DISTANCE: {result['target_distance_deg']:.2f}deg")
+            print(f"   WHITE={result['white_distance_deg']:.2f}deg BLACK={result['black_distance_deg']:.2f}deg")
     cap.release()
     whites = sum(x["result"] == "WHITE" for x in checks)
     blacks = sum(x["result"] == "BLACK" for x in checks)
+    uncertain = sum(x["result"] == "UNCERTAIN" for x in checks)
     report = {
         "file": path,
         "space_times": spaces,
         "sample_fps": args.sample_fps,
         "rules": {"white": "TOP 1", "black": "TOP 2", "position": "random/per-check detection", "color": "adaptive, not exact RGB"},
         "engine": {"frames": "every sampled frame", "hough_passes": 36, "window_before_space_s": 2.5, "window_after_space_s": 0.2},
-        "summary": {"checks": len(checks), "white": whites, "black": blacks, "unknown": len(checks) - whites - blacks},
+        "summary": {"checks": len(checks), "white": whites, "black": blacks, "uncertain": uncertain},
         "checks": checks,
     }
-    atomic_report(report)
-    print(f"ИТОГ: Checks={len(checks)} WHITE={whites} BLACK={blacks}")
+    report_name = Path(f"analysis_session_{Path(path).stem}.json")
+    write_atomic_json(report_name, report)
+    if line_count(report_name) > REPORT_LIMIT_LINES:
+        print(f"JSON: {report_name} больше {REPORT_LIMIT_LINES} строк")
+    merge_reports({"file": path, "report_file": report_name.name, "summary": report["summary"], "space_times": spaces, "checks": checks})
+    print(f"ИТОГ: Checks={len(checks)} WHITE={whites} BLACK={blacks} UNCERTAIN={uncertain}")
 
 
 if __name__ == "__main__":
