@@ -30,13 +30,18 @@ def request_stop(signum, frame):
     STOP_REQUESTED = True
 
 
-def next_output():
-    i = 1
-    while True:
-        path = Path(f"session_{i:04d}.mkv")
-        if not path.exists():
-            return path
-        i += 1
+def first_free_session_id():
+    ids = []
+    for path in Path('.').glob('session_*.mkv'):
+        try:
+            ids.append(int(path.stem.split('_')[-1]))
+        except ValueError:
+            pass
+    return max(ids, default=0) + 1
+
+
+def session_output(session_id):
+    return Path(f"session_{session_id:04d}.mkv")
 
 
 def event_worker(device_path, start_time, event_log):
@@ -62,11 +67,11 @@ def event_worker(device_path, start_time, event_log):
 
 def start_event_worker(device, start_time, event_log):
     return subprocess.Popen(
-        ["sudo", sys.executable, str(Path(__file__).resolve()), "--worker", "--device", device, "--start-time", str(start_time), "--log", str(event_log)],
-        stdin=None,
+        ["sudo", "-n", sys.executable, str(Path(__file__).resolve()), "--worker", "--device", device, "--start-time", str(start_time), "--log", str(event_log)],
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
-        preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_IGN),
+        start_new_session=True,
     )
 
 
@@ -74,16 +79,25 @@ def stop_process(process, sig=signal.SIGTERM, timeout=5):
     if process is None or process.poll() is not None:
         return
     try:
-        process.send_signal(sig)
-    except ProcessLookupError:
-        return
+        os.killpg(process.pid, sig)
+    except (ProcessLookupError, PermissionError):
+        try:
+            process.send_signal(sig)
+        except ProcessLookupError:
+            return
     try:
         process.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         try:
-            process.kill()
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+        try:
             process.wait(timeout=2)
-        except (subprocess.TimeoutExpired, ProcessLookupError):
+        except subprocess.TimeoutExpired:
             pass
 
 
@@ -219,71 +233,77 @@ def write_event_attachment(events, path):
             f.write(f"{timestamp:.9f}\t{event}\n")
 
 
-def analyze_output(output):
-    analyzer = Path(__file__).resolve().with_name("analyze_skillcheck.py")
-    if not analyzer.exists():
-        print("Анализатор не найден: analyze_skillcheck.py")
-        return
-    print(f"\n[{output.name}] АВТОАНАЛИЗ")
-    result = subprocess.run([sys.executable, str(analyzer), str(output)], cwd=str(analyzer.parent))
-    if result.returncode != 0:
-        print(f"[{output.name}] Анализатор завершился с кодом {result.returncode}")
-
-
-def finalize_recording(raw_video, events_path, output):
+def finalize_recording(raw_video, events_path, output, session_dir):
     try:
         events_data = json.loads(Path(events_path).read_text(encoding="utf-8"))
         events = [(float(t), str(e)) for t, e in events_data]
-    except Exception as exc:
-        print(f"Ошибка чтения событий для {output.name}: {exc}")
+    except Exception:
         Path(raw_video).unlink(missing_ok=True)
         Path(events_path).unlink(missing_ok=True)
+        Path(session_dir).mkdir(parents=True, exist_ok=True)
+        Path(session_dir).rmdir()
         return 1
 
     space_down = sum(event == "SPACE_DOWN" for _, event in events)
     if space_down == 0:
-        print(f"{output.name}: SPACE не нажимался → файл НЕ сохраняю.")
         Path(raw_video).unlink(missing_ok=True)
         Path(events_path).unlink(missing_ok=True)
+        try:
+            Path(session_dir).rmdir()
+        except OSError:
+            pass
         return 0
 
     try:
-        with tempfile.TemporaryDirectory(prefix="violence_district_session_") as temp_dir:
-            temp = Path(temp_dir)
-            event_attachment = temp / "events.tsv"
-            subtitles = temp / "events.ass"
-            print(f"\n[{output.name}] Анализирую skill-check...")
-            skill_checks = detect_skill_checks(Path(raw_video))
-            print(f"[{output.name}] Найдено skill-check: {len(skill_checks)}")
-            for index, item in enumerate(skill_checks, 1):
-                print(f"[{output.name}]   #{index}: {item['start']:.3f}s - {item['end']:.3f}s")
-            write_event_attachment(events, event_attachment)
-            make_subtitles(events, skill_checks, subtitles)
-            subprocess.run([
-                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-                "-i", str(raw_video), "-i", str(subtitles), "-attach", str(event_attachment),
-                "-map", "0", "-map", "1:0", "-c:v", "copy", "-c:a", "copy", "-c:s", "ass",
-                "-metadata:s:s:0", "title=Collector Events", "-metadata:s:t", "mimetype=text/plain",
-                "-metadata:s:t", "filename=events.tsv", str(output)
-            ], check=True)
+        temp = Path(session_dir)
+        event_attachment = temp / "events.tsv"
+        subtitles = temp / "events.ass"
+        skill_checks = detect_skill_checks(Path(raw_video))
+        write_event_attachment(events, event_attachment)
+        make_subtitles(events, skill_checks, subtitles)
+        subprocess.run([
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-i", str(raw_video), "-i", str(subtitles), "-attach", str(event_attachment),
+            "-map", "0", "-map", "1:0", "-c:v", "copy", "-c:a", "copy", "-c:s", "ass",
+            "-metadata:s:s:0", "title=Collector Events", "-metadata:s:t", "mimetype=text/plain",
+            "-metadata:s:t", "filename=events.tsv", str(output)
+        ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         Path(raw_video).unlink(missing_ok=True)
         Path(events_path).unlink(missing_ok=True)
-        print(f"\n[{output.name}] ГОТОВО: SPACE={space_down}, SKILL-CHECK={len(skill_checks)}, размер={output.stat().st_size / 1024 / 1024:.2f} MB")
         analyze_output(output)
+        try:
+            Path(event_attachment).unlink(missing_ok=True)
+            Path(subtitles).unlink(missing_ok=True)
+            Path(session_dir).rmdir()
+        except OSError:
+            pass
         return 0
-    except Exception as exc:
-        print(f"[{output.name}] ОШИБКА обработки: {exc}")
+    except Exception:
+        Path(events_path).unlink(missing_ok=True)
+        Path(raw_video).unlink(missing_ok=True)
+        try:
+            Path(session_dir).rmdir()
+        except OSError:
+            pass
         return 1
 
 
-def launch_finalizer(raw_video, events, output, temp_dir):
-    events_path = temp_dir / f"{output.stem}.events.json"
+def analyze_output(output):
+    analyzer = Path(__file__).resolve().with_name("analyze_skillcheck.py")
+    if not analyzer.exists():
+        return
+    subprocess.run([sys.executable, str(analyzer), str(output)], cwd=str(analyzer.parent), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def launch_finalizer(raw_video, events, output):
+    session_dir = Path(tempfile.mkdtemp(prefix=f"violence_district_{output.stem}_"))
+    events_path = session_dir / f"{output.stem}.events.json"
     events_path.write_text(json.dumps(events, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
     return subprocess.Popen(
-        [sys.executable, str(Path(__file__).resolve()), "--finalize", "--raw", str(raw_video), "--events", str(events_path), "--output", str(output)],
+        [sys.executable, str(Path(__file__).resolve()), "--finalize", "--raw", str(raw_video), "--events", str(events_path), "--output", str(output), "--session-dir", str(session_dir)],
         stdin=subprocess.DEVNULL,
-        stdout=None,
-        stderr=None,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
 
@@ -302,94 +322,96 @@ def main():
     parser.add_argument("--raw")
     parser.add_argument("--events")
     parser.add_argument("--output")
+    parser.add_argument("--session-dir")
     args = parser.parse_args()
 
     if args.worker:
         event_worker(args.device, args.start_time, args.log)
         return
     if args.finalize:
-        raise SystemExit(finalize_recording(Path(args.raw), Path(args.events), Path(args.output)))
+        raise SystemExit(finalize_recording(Path(args.raw), Path(args.events), Path(args.output), Path(args.session_dir)))
 
     print("=== Violence District DATA COLLECTOR ===\n")
     print(f"Область: {REGION}")
-    print(f"FPS: {FPS}\n")
-    print("Зажми ЛКМ на генераторе.")
-    print("Проходи skill-check вручную через Space.")
-    print("Отпусти ЛКМ после теста.\n")
-    print("Каждый новый LMB DOWN создаёт отдельный session_XXXX.mkv.")
-    print("Если SPACE не нажимался, сессия не сохраняется.")
-    print("Анализ каждого завершённого файла работает отдельно и не блокирует следующую запись.\n")
-    print("Ctrl+C — остановить collector. Фоновые анализы продолжат работу.\n")
-    print("Ожидаю ЛКМ...\n")
+    print(f"FPS: {FPS}")
+    print("Зажми ЛКМ на генераторе, проходи skill-check через Space, отпусти ЛКМ.")
+    print("Каждый LMB DOWN получает уникальный номер. SPACE=0 не сохраняется.")
+    print("Анализ запускается отдельно для каждой сессии и не блокирует следующую запись.")
+    print("Ctrl+C — остановить collector. Уже запущенные анализы не прерываются.\n")
     subprocess.run(["sudo", "-v"], check=True)
 
-    with tempfile.TemporaryDirectory(prefix="violence_district_") as temp_dir:
-        temp = Path(temp_dir)
-        event_log = temp / "events.log"
-        start_time = time.monotonic()
-        mouse_worker = start_event_worker(MOUSE_DEVICE, start_time, event_log)
-        keyboard_worker = start_event_worker(KEYBOARD_DEVICE, start_time, event_log)
-        recording = False
-        recorder = None
-        session_start = None
-        session_events = []
-        handled_events = 0
-        finalizers = []
+    event_root = Path(tempfile.mkdtemp(prefix="violence_district_events_"))
+    event_log = event_root / "events.log"
+    start_time = time.monotonic()
+    mouse_worker = start_event_worker(MOUSE_DEVICE, start_time, event_log)
+    keyboard_worker = start_event_worker(KEYBOARD_DEVICE, start_time, event_log)
+    recording = False
+    recorder = None
+    session_start = None
+    session_events = []
+    output = None
+    raw_video = None
+    handled_events = 0
+    next_id = first_free_session_id()
+    finalizers = {}
 
+    try:
+        while not STOP_REQUESTED:
+            events = parse_events(event_log)
+            new_events = events[handled_events:]
+            handled_events = len(events)
+            for timestamp, event in new_events:
+                if STOP_REQUESTED:
+                    break
+                if event == "LMB_DOWN" and not recording:
+                    recording = True
+                    session_start = timestamp
+                    session_events = [(timestamp, event)]
+                    output = session_output(next_id)
+                    next_id += 1
+                    raw_dir = Path(tempfile.mkdtemp(prefix=f"violence_district_capture_{output.stem}_"))
+                    raw_video = raw_dir / f"capture_{output.stem}.mkv"
+                    recorder = subprocess.Popen([
+                        "gpu-screen-recorder", "-w", REGION, "-f", str(FPS), "-c", "mkv", "-o", str(raw_video)
+                    ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+                    print(f"ЛКМ зажата → {output.stem}: запись")
+                elif recording:
+                    session_events.append((timestamp, event))
+                    if event == "LMB_UP":
+                        session_end = timestamp
+                        stop_process(recorder, signal.SIGINT, 8)
+                        recorder = None
+                        recording = False
+                        normalized = get_session_events(session_events, session_start, session_end)
+                        process = launch_finalizer(raw_video, normalized, output)
+                        finalizers[process] = output
+                        print(f"ЛКМ отпущена → {output.stem}: анализ в фоне")
+                        session_start = None
+                        session_events = []
+                        output = None
+                        raw_video = None
+
+            finished = []
+            for process, name in finalizers.items():
+                if process.poll() is not None:
+                    if process.returncode == 0 and Path(name).exists():
+                        print(f"{name.stem}: ГОТОВО")
+                    elif process.returncode == 0:
+                        print(f"{name.stem}: SPACE не было, файл удалён")
+                    else:
+                        print(f"{name.stem}: ошибка анализа")
+                    finished.append(process)
+            for process in finished:
+                del finalizers[process]
+            time.sleep(0.01)
+    finally:
+        stop_process(recorder, signal.SIGINT, 5)
+        stop_process(mouse_worker, signal.SIGTERM, 3)
+        stop_process(keyboard_worker, signal.SIGTERM, 3)
         try:
-            while not STOP_REQUESTED:
-                events = parse_events(event_log)
-                new_events = events[handled_events:]
-                handled_events = len(events)
-
-                for timestamp, event in new_events:
-                    if STOP_REQUESTED:
-                        break
-                    if event == "LMB_DOWN" and not recording:
-                        recording = True
-                        session_start = timestamp
-                        session_events = [(timestamp, event)]
-                        output = next_output()
-                        raw_video = temp / f"capture_{output.stem}.mkv"
-                        recorder = subprocess.Popen(
-                            ["gpu-screen-recorder", "-w", REGION, "-f", str(FPS), "-c", "mkv", "-o", str(raw_video)],
-                            stdin=subprocess.DEVNULL,
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL,
-                            start_new_session=True,
-                        )
-                        print(f"\nЛКМ зажата → НАЧАЛО СБОРА: {output.name}\n")
-                    elif recording:
-                        session_events.append((timestamp, event))
-                        if event == "LMB_UP":
-                            session_end = timestamp
-                            print(f"\nЛКМ отпущена → {output.name}: запись завершена, анализ отправлен в фон\n")
-                            stop_process(recorder, signal.SIGINT, 8)
-                            recorder = None
-                            recording = False
-                            normalized = get_session_events(session_events, session_start, session_end)
-                            finalizers.append(launch_finalizer(raw_video, normalized, output, temp))
-                            session_start = None
-                            session_events = []
-                            print("Ожидаю ЛКМ...\n")
-
-                if recorder is not None and recorder.poll() is not None:
-                    print("ОШИБКА: gpu-screen-recorder завершился во время записи.")
-                    recorder = None
-                    recording = False
-                    session_start = None
-                    session_events = []
-
-                finalizers = [p for p in finalizers if p.poll() is None]
-                time.sleep(0.01)
-        finally:
-            if STOP_REQUESTED:
-                print("\nОстанавливаю collector...")
-            stop_process(recorder, signal.SIGINT, 5)
-            stop_process(mouse_worker, signal.SIGTERM, 2)
-            stop_process(keyboard_worker, signal.SIGTERM, 2)
-            if finalizers:
-                print(f"Фоновых анализов продолжают работу: {len(finalizers)}")
+            event_root.rmdir()
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":
