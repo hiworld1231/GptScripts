@@ -74,13 +74,14 @@ def predict(a,t):
  x=a[-1]; cand=[]
  for k in range(-3,4): cand.append((abs((x+2*np.pi*k-b)/v-t[-1]),(x+2*np.pi*k-b)/v,v))
  d,z,v=min(cand,key=lambda x:x[0])
- return z,v if d<.6 else None
+ if d>=.6:return None
+ return z,v
 
 def evaluate(feat,spaces,priority):
  t=np.array([x[0] for x in feat]); best=[]; total=0; err=0
  for s in spaces:
   mask=(t>=s-.5)&(t<=s+.05); ix=np.where(mask)[0]
-  if len(ix)<6: best.append({'space':s,'result':'UNKNOWN'}); continue
+  if len(ix)<6: best.append({'space':s,'result':'UNKNOWN','error':None,'predicted':None,'speed':None}); continue
   wa=np.array([feat[i][1] for i in ix]); ba=np.array([feat[i][4] for i in ix]); tt=t[ix]
   wp=predict(wa,tt); bp=predict(ba,tt)
   wc=None if wp is None else abs(wp[0]-s); bc=None if bp is None else abs(bp[0]-s)
@@ -107,7 +108,7 @@ def main():
   c={k:sum(x['result']==k for x in d) for k in ['WHITE','BLACK','UNKNOWN']};print(f'#{i} score={s:.2f} ring={r} priority={pr} WHITE={c["WHITE"]} BLACK={c["BLACK"]} UNKNOWN={c["UNKNOWN"]}')
  s,r,pr,det=ranked[0];print('\n========== BEST ==========');print(f'Score: {s:.2f}');print('Приоритет: WHITE TOP 1 -> BLACK TOP 2')
  for i,x in enumerate(det,1):
-  if x['error'] is None:print(f'#{i} SPACE {x["space"]:.3f} -> UNKNOWN')
+  if x.get('error') is None:print(f'#{i} SPACE {x["space"]:.3f} -> UNKNOWN')
   else:print(f'#{i} SPACE {x["space"]:.3f} -> {x["result"]} predicted={x["predicted"]:.3f} error={x["error"]*1000:.1f}ms speed={math.degrees(x["speed"]):.1f}deg/s')
  report={'file':p,'space_times':spaces,'tests':len(ranked),'best_score':s,'best_ring':r,'priority':pr,'best':det,'top':[{'score':x[0],'ring':x[1],'priority':x[2],'details':x[3]} for x in ranked]}
  json.dump(report,open('analysis_report.json','w',encoding='utf8'),ensure_ascii=False,indent=2);print('\nОтчёт сохранён: analysis_report.json')
