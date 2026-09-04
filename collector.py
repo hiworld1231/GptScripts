@@ -61,6 +61,12 @@ def event_worker(device_path, start_time, event_log):
                         f.write(f"{timestamp:.9f}\tSPACE_DOWN\n")
                     elif event.value == 0:
                         f.write(f"{timestamp:.9f}\tSPACE_UP\n")
+                elif event.code == ecodes.KEY_E:
+                    if event.value == 1:
+                        f.write(f"{timestamp:.9f}\tLABEL_WHITE\n")
+                elif event.code == ecodes.KEY_Q:
+                    if event.value == 1:
+                        f.write(f"{timestamp:.9f}\tLABEL_BLACK\n")
     except Exception as exc:
         try:
             with open(event_log, "a", buffering=1, encoding="utf-8") as f:
@@ -72,13 +78,7 @@ def event_worker(device_path, start_time, event_log):
 
 def start_event_worker(device, start_time, event_log, error_log):
     error_file = open(error_log, "a", encoding="utf-8")
-    process = subprocess.Popen(
-        ["sudo", "-n", sys.executable, str(Path(__file__).resolve()), "--worker", "--device", device, "--start-time", str(start_time), "--log", str(event_log)],
-        stdin=None,
-        stdout=subprocess.DEVNULL,
-        stderr=error_file,
-        preexec_fn=os.setpgrp,
-    )
+    process = subprocess.Popen(["sudo", "-n", sys.executable, str(Path(__file__).resolve()), "--worker", "--device", device, "--start-time", str(start_time), "--log", str(event_log)], stdin=None, stdout=subprocess.DEVNULL, stderr=error_file, preexec_fn=os.setpgrp)
     return process, error_file
 
 
@@ -125,10 +125,6 @@ def parse_events(path):
             except ValueError:
                 continue
     return sorted(events, key=lambda x: x[0])
-
-
-def get_session_events(events, start_time, end_time):
-    return [(max(0.0, timestamp - start_time), event) for timestamp, event, _ in events if start_time <= timestamp <= end_time and event in {"LMB_DOWN", "LMB_UP", "SPACE_DOWN", "SPACE_UP"}]
 
 
 def ass_time(seconds):
@@ -180,33 +176,23 @@ def finalize_recording(raw_video, events_path, output, session_dir, analysis_log
         Path(events_path).unlink(missing_ok=True)
         Path(analysis_log).write_text(f"Ошибка чтения событий: {exc}\n", encoding="utf-8")
         return 1
-
     spaces = sum(event == "SPACE_DOWN" for _, event in events)
     if spaces == 0:
         Path(raw_video).unlink(missing_ok=True)
         Path(events_path).unlink(missing_ok=True)
         Path(analysis_log).write_text("SPACE не было — файл удалён, анализ не запускался.\n", encoding="utf-8")
         return 0
-
     temp = Path(session_dir)
     subtitles = temp / "events.ass"
     attachment = temp / "events.tsv"
     try:
         make_subtitles(events, subtitles)
         write_event_attachment(events, attachment)
-        subprocess.run([
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-            "-i", str(raw_video), "-i", str(subtitles), "-attach", str(attachment),
-            "-map", "0", "-map", "1:0", "-c:v", "copy", "-c:a", "copy", "-c:s", "ass",
-            "-metadata:s:s:0", "title=Collector Events", "-metadata:s:t", "mimetype=text/plain",
-            "-metadata:s:t", "filename=events.tsv", str(output)
-        ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(raw_video), "-i", str(subtitles), "-attach", str(attachment), "-map", "0", "-map", "1:0", "-c:v", "copy", "-c:a", "copy", "-c:s", "ass", "-metadata:s:s:0", "title=Collector Events", "-metadata:s:t", "mimetype=text/plain", "-metadata:s:t", "filename=events.tsv", str(output)], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         Path(raw_video).unlink(missing_ok=True)
         Path(events_path).unlink(missing_ok=True)
         rc = analyze_output(output, Path(analysis_log))
-        if rc != 0:
-            return 1
-        return 0
+        return rc
     except Exception as exc:
         Path(raw_video).unlink(missing_ok=True)
         Path(events_path).unlink(missing_ok=True)
@@ -228,13 +214,7 @@ def launch_finalizer(raw_video, events, output):
     analysis_log = Path(f".analysis_{output.stem}.log")
     analysis_log.write_text("Подготовка анализа...\n", encoding="utf-8")
     events_path.write_text(json.dumps(events, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
-    process = subprocess.Popen(
-        [sys.executable, str(Path(__file__).resolve()), "--finalize", "--raw", str(raw_video), "--events", str(events_path), "--output", str(output), "--session-dir", str(session_dir), "--analysis-log", str(analysis_log)],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+    process = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--finalize", "--raw", str(raw_video), "--events", str(events_path), "--output", str(output), "--session-dir", str(session_dir), "--analysis-log", str(analysis_log)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
     return process, analysis_log
 
 
@@ -257,7 +237,6 @@ def main():
     global STOP_REQUESTED
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
-
     parser = argparse.ArgumentParser()
     parser.add_argument("--worker", action="store_true")
     parser.add_argument("--finalize", action="store_true")
@@ -270,22 +249,20 @@ def main():
     parser.add_argument("--session-dir")
     parser.add_argument("--analysis-log")
     args = parser.parse_args()
-
     if args.worker:
         event_worker(args.device, args.start_time, args.log)
         return
     if args.finalize:
         raise SystemExit(finalize_recording(Path(args.raw), Path(args.events), Path(args.output), Path(args.session_dir), Path(args.analysis_log)))
-
     log("=== Violence District DATA COLLECTOR ===\n")
     log(f"Область: {REGION}")
     log(f"FPS: {FPS}")
-    log("Зажми ЛКМ на генераторе, проходи skill-check через Space, отпусти ЛКМ.")
+    log("Зажми ЛКМ на генераторе, проходи skill-check через Space, после каждого Space нажми E=WHITE или Q=BLACK.")
+    log("Пример: Space, Space, E, Q → первый WHITE, второй BLACK.")
     log("Каждый LMB DOWN получает уникальный номер. SPACE=0 не сохраняется.")
     log("Анализ запускается отдельно для каждой сессии и не блокирует следующую запись.")
     log("Ctrl+C — остановить collector. Уже запущенные анализы не прерываются.\n")
     subprocess.run(["sudo", "-v"], check=True)
-
     event_root = Path(tempfile.mkdtemp(prefix="violence_district_events_"))
     event_log = event_root / "events.log"
     mouse_error = event_root / "mouse_worker.err"
@@ -299,19 +276,10 @@ def main():
         log("Ввод: мышь слушается")
     else:
         log(f"Ввод: ОБРАБОТЧИК МЫШИ УПАЛ (код {mouse_worker.returncode})")
-        mouse_error_file.flush()
-        text = mouse_error.read_text(encoding="utf-8", errors="replace").strip()
-        if text:
-            log(text)
     if keyboard_worker.poll() is None:
         log("Ввод: клавиатура слушается")
     else:
         log(f"Ввод: ОБРАБОТЧИК КЛАВИАТУРЫ УПАЛ (код {keyboard_worker.returncode})")
-        keyboard_error_file.flush()
-        text = keyboard_error.read_text(encoding="utf-8", errors="replace").strip()
-        if text:
-            log(text)
-
     recording = False
     recorder = None
     session_start = None
@@ -321,7 +289,6 @@ def main():
     handled_events = 0
     next_id = first_free_session_id()
     finalizers = {}
-
     try:
         while not STOP_REQUESTED:
             events = parse_events(event_log)
@@ -339,7 +306,7 @@ def main():
                 if event == "LMB_DOWN" and not recording:
                     recording = True
                     session_start = timestamp
-                    session_events = [(timestamp, event)]
+                    session_events = [(0.0, event)]
                     output = session_output(next_id)
                     next_id += 1
                     raw_dir = Path(tempfile.mkdtemp(prefix=f"violence_district_capture_{output.stem}_"))
@@ -349,10 +316,15 @@ def main():
                     continue
                 if recording:
                     relative = max(0.0, timestamp - session_start)
-                    session_events.append((relative, event))
+                    if event != "LMB_DOWN":
+                        session_events.append((relative, event))
                     if event == "SPACE_DOWN":
                         count = sum(e == "SPACE_DOWN" for _, e in session_events)
                         log(f"[{timestamp:8.3f}s] {output.name}: SPACE #{count} ({relative:.3f}s)")
+                    elif event == "LABEL_WHITE":
+                        log(f"[{timestamp:8.3f}s] {output.name}: E → WHITE ({relative:.3f}s)")
+                    elif event == "LABEL_BLACK":
+                        log(f"[{timestamp:8.3f}s] {output.name}: Q → BLACK ({relative:.3f}s)")
                     elif event == "LMB_UP":
                         log(f"[{timestamp:8.3f}s] ЛКМ ОТПУЩЕНА → ЗАВЕРШЕНИЕ: {output.name}")
                         stop_process(recorder, signal.SIGINT, timeout=10)
@@ -369,7 +341,8 @@ def main():
                         else:
                             finalizer, analysis_log = launch_finalizer(raw_video, session_events, output)
                             finalizers[output.name] = (finalizer, analysis_log)
-                            log(f"{output.name}: анализ запущен отдельно, SPACE={spaces}")
+                            labels = sum(e in {"LABEL_WHITE", "LABEL_BLACK"} for _, e in session_events)
+                            log(f"{output.name}: анализ запущен отдельно, SPACE={spaces}, LABELS={labels}")
                         session_start = None
                         session_events = []
                         output = None
@@ -378,16 +351,6 @@ def main():
                 if process.poll() is not None:
                     print_analysis_log(name, analysis_log)
                     del finalizers[name]
-            if mouse_worker.poll() is not None and not STOP_REQUESTED:
-                log(f"Ввод: обработчик мыши завершился с кодом {mouse_worker.returncode}")
-                text = mouse_error.read_text(encoding="utf-8", errors="replace").strip()
-                if text:
-                    log(text)
-            if keyboard_worker.poll() is not None and not STOP_REQUESTED:
-                log(f"Ввод: обработчик клавиатуры завершился с кодом {keyboard_worker.returncode}")
-                text = keyboard_error.read_text(encoding="utf-8", errors="replace").strip()
-                if text:
-                    log(text)
             time.sleep(0.01)
     finally:
         if recorder is not None:
