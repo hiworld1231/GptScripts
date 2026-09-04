@@ -7,6 +7,7 @@ import re
 import subprocess
 import tempfile
 import fcntl
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -178,13 +179,7 @@ def local_check(cap, fps, start, end, sample_fps):
             score, c, feat = hit
             if previous is None or math.hypot(c[0] - previous[0], c[1] - previous[1]) < 70:
                 previous = c
-                rows.append({
-                    "t": frame_i / fps, "x": c[0], "y": c[1], "r": c[2], "score": score,
-                    "white_angle": feat[0], "white_strength": feat[1], "white_peak": feat[2],
-                    "black_angle": feat[3], "black_strength": feat[4], "black_peak": feat[5],
-                    "red_angle": feat[6], "red_strength": feat[7], "red_peak": feat[8],
-                    "edge_angle": feat[9], "edge_strength": feat[10], "edge_peak": feat[11],
-                })
+                rows.append({"t": frame_i / fps, "x": c[0], "y": c[1], "r": c[2], "score": score, "white_angle": feat[0], "white_strength": feat[1], "white_peak": feat[2], "black_angle": feat[3], "black_strength": feat[4], "black_peak": feat[5], "red_angle": feat[6], "red_strength": feat[7], "red_peak": feat[8], "edge_angle": feat[9], "edge_strength": feat[10], "edge_peak": feat[11]})
         frame_i += 1
     return rows
 
@@ -252,22 +247,7 @@ def summarize(rows, space):
             result = "UNCERTAIN"
         target_distance = None
         wd = bd = None
-    return {
-        "result": result,
-        "frames": len(rows),
-        "first_t": rows[0]["t"],
-        "last_t": rows[-1]["t"],
-        "center_mean": [float(np.mean([x["x"] for x in rows])), float(np.mean([x["y"] for x in rows]))],
-        "radius_mean": float(np.mean([x["r"] for x in rows])),
-        "white_angle_deg": math.degrees(white_angle) if white_angle is not None else None,
-        "black_angle_deg": math.degrees(black_angle) if black_angle is not None else None,
-        "white_strength": white_strength,
-        "black_strength": black_strength,
-        "red_prediction": red,
-        "white_distance_deg": wd,
-        "black_distance_deg": bd,
-        "target_distance_deg": target_distance,
-    }
+    return {"result": result, "frames": len(rows), "first_t": rows[0]["t"], "last_t": rows[-1]["t"], "center_mean": [float(np.mean([x["x"] for x in rows])), float(np.mean([x["y"] for x in rows]))], "radius_mean": float(np.mean([x["r"] for x in rows])), "white_angle_deg": math.degrees(white_angle) if white_angle is not None else None, "black_angle_deg": math.degrees(black_angle) if black_angle is not None else None, "white_strength": white_strength, "black_strength": black_strength, "red_prediction": red, "white_distance_deg": wd, "black_distance_deg": bd, "target_distance_deg": target_distance}
 
 
 def write_atomic_json(path, data):
@@ -326,57 +306,42 @@ def merge_reports(session_report):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("file", nargs="?")
-    ap.add_argument("--sample-fps", type=int, default=60)
+    ap.add_argument("--sample-fps", type=float, default=60.0)
+    ap.add_argument("--before", type=float, default=2.5)
+    ap.add_argument("--after", type=float, default=0.2)
     args = ap.parse_args()
     path = args.file or newest()
-    info = probe(path)
-    ev = events(path)
-    downs = [x[0] for x in ev if x[1] == "LMB_DOWN"]
-    off = downs[0] if downs else 0.0
-    spaces = [x[0] - off for x in ev if x[1] == "SPACE_DOWN"]
-    spaces = [x for x in spaces if x >= 0]
+    print(f"===== АНАЛИЗ {path} =====")
     print(f"Файл: {path}")
-    print(f"Видео: {info.get('width')}x{info.get('height')} fps={info.get('r_frame_rate')}")
+    meta = probe(path)
+    print(f"Видео: {meta['width']}x{meta['height']} fps={meta['r_frame_rate']}")
+    ev = events(path)
+    spaces = [t for t, k in ev if k == "SPACE_DOWN"]
     print(f"SPACE: {len(spaces)}")
-    print(f"SPACE times: {', '.join(f'{x:.3f}' for x in spaces)}")
-    print(f"Анализ: {args.sample_fps} FPS, каждый кадр, 36 Hough-проходов, adaptive HSV, random center")
+    print("SPACE times: " + ", ".join(f"{t:.3f}" for t in spaces))
+    print(f"Анализ: {args.sample_fps:g} FPS, каждый кадр, 36 Hough-проходов, adaptive HSV, random center")
     cap = cv2.VideoCapture(path)
-    fps = cap.get(cv2.CAP_PROP_FPS) or 60.0
     checks = []
-    for index, space in enumerate(spaces, 1):
-        start = max(0.0, space - 2.5)
-        end = space + 0.20
-        rows = local_check(cap, fps, start, end, args.sample_fps)
-        result = summarize(rows, space)
-        result["space"] = space
-        result["index"] = index
-        result["trajectory"] = rows
-        checks.append(result)
-        print(f"#{index} SPACE={space:.3f} frames={len(rows)} -> {result['result']}")
-        if result.get("red_prediction"):
-            r = result["red_prediction"]
-            print(f"   RED: angle={math.degrees(r['predicted_angle']) % 360:.1f} speed={r['speed_deg_s']:.1f}deg/s residual={r['fit_residual_deg']:.2f}deg")
-        if result.get("target_distance_deg") is not None:
-            print(f"   WHITE={result['white_distance_deg']:.2f}deg BLACK={result['black_distance_deg']:.2f}deg")
+    for i, space in enumerate(spaces, 1):
+        rows = local_check(cap, float(eval_fraction(meta["r_frame_rate"])), max(0, space - args.before), space + args.after, args.sample_fps)
+        summary = summarize(rows, space)
+        summary["space"] = space
+        summary["index"] = i
+        checks.append({"summary": summary, "trajectory": rows})
+        print(f"#{i} SPACE={space:.3f} frames={len(rows)} -> {summary['result']}")
     cap.release()
-    whites = sum(x["result"] == "WHITE" for x in checks)
-    blacks = sum(x["result"] == "BLACK" for x in checks)
-    uncertain = sum(x["result"] == "UNCERTAIN" for x in checks)
-    report = {
-        "file": path,
-        "space_times": spaces,
-        "sample_fps": args.sample_fps,
-        "rules": {"white": "TOP 1", "black": "TOP 2", "position": "random/per-check detection", "color": "adaptive, not exact RGB"},
-        "engine": {"frames": "every sampled frame", "hough_passes": 36, "window_before_space_s": 2.5, "window_after_space_s": 0.2},
-        "summary": {"checks": len(checks), "white": whites, "black": blacks, "uncertain": uncertain},
-        "checks": checks,
-    }
+    report = {"file": path, "video": meta, "events": ev, "summary": {"checks": len(checks), "white": sum(x["summary"]["result"] == "WHITE" for x in checks), "black": sum(x["summary"]["result"] == "BLACK" for x in checks), "uncertain": sum(x["summary"]["result"] == "UNCERTAIN" for x in checks), "no_circle": sum(x["summary"]["result"] == "NO_CIRCLE" for x in checks)}, "checks": checks}
     report_name = Path(f"analysis_session_{Path(path).stem}.json")
     write_atomic_json(report_name, report)
-    if line_count(report_name) > REPORT_LIMIT_LINES:
-        print(f"JSON: {report_name} больше {REPORT_LIMIT_LINES} строк")
-    merge_reports({"file": path, "report_file": report_name.name, "summary": report["summary"], "space_times": spaces, "checks": checks})
-    print(f"ИТОГ: Checks={len(checks)} WHITE={whites} BLACK={blacks} UNCERTAIN={uncertain}")
+    session_report = {"file": path, "report_file": report_name.name, "summary": report["summary"], "space_times": spaces, "checks": checks}
+    merge_reports(session_report)
+    print(f"ИТОГ: Checks={len(checks)} WHITE={report['summary']['white']} BLACK={report['summary']['black']} UNCERTAIN={report['summary']['uncertain']} NO_CIRCLE={report['summary']['no_circle']}")
+    print(f"===== КОНЕЦ АНАЛИЗА {path} =====")
+
+
+def eval_fraction(value):
+    a, b = value.split("/")
+    return float(a) / float(b)
 
 
 if __name__ == "__main__":
