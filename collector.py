@@ -30,6 +30,10 @@ def request_stop(signum, frame):
     STOP_REQUESTED = True
 
 
+def log(message):
+    print(message, flush=True)
+
+
 def first_free_session_id():
     ids = []
     for path in Path('.').glob('session_*.mkv'):
@@ -233,21 +237,25 @@ def write_event_attachment(events, path):
             f.write(f"{timestamp:.9f}\t{event}\n")
 
 
-def finalize_recording(raw_video, events_path, output, session_dir):
+def finalize_recording(raw_video, events_path, output, session_dir, analysis_log):
     try:
         events_data = json.loads(Path(events_path).read_text(encoding="utf-8"))
         events = [(float(t), str(e)) for t, e in events_data]
-    except Exception:
+    except Exception as exc:
         Path(raw_video).unlink(missing_ok=True)
         Path(events_path).unlink(missing_ok=True)
-        Path(session_dir).mkdir(parents=True, exist_ok=True)
-        Path(session_dir).rmdir()
+        Path(analysis_log).write_text(f"Ошибка чтения событий: {exc}\n", encoding="utf-8")
+        try:
+            Path(session_dir).rmdir()
+        except OSError:
+            pass
         return 1
 
     space_down = sum(event == "SPACE_DOWN" for _, event in events)
     if space_down == 0:
         Path(raw_video).unlink(missing_ok=True)
         Path(events_path).unlink(missing_ok=True)
+        Path(analysis_log).write_text("SPACE не было — анализ не запускался.\n", encoding="utf-8")
         try:
             Path(session_dir).rmdir()
         except OSError:
@@ -270,7 +278,7 @@ def finalize_recording(raw_video, events_path, output, session_dir):
         ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         Path(raw_video).unlink(missing_ok=True)
         Path(events_path).unlink(missing_ok=True)
-        analyze_output(output)
+        analyze_output(output, Path(analysis_log))
         try:
             Path(event_attachment).unlink(missing_ok=True)
             Path(subtitles).unlink(missing_ok=True)
@@ -278,9 +286,10 @@ def finalize_recording(raw_video, events_path, output, session_dir):
         except OSError:
             pass
         return 0
-    except Exception:
+    except Exception as exc:
         Path(events_path).unlink(missing_ok=True)
         Path(raw_video).unlink(missing_ok=True)
+        Path(analysis_log).write_text(f"Ошибка анализа/сборки: {exc}\n", encoding="utf-8")
         try:
             Path(session_dir).rmdir()
         except OSError:
@@ -288,24 +297,56 @@ def finalize_recording(raw_video, events_path, output, session_dir):
         return 1
 
 
-def analyze_output(output):
+def analyze_output(output, log_path):
     analyzer = Path(__file__).resolve().with_name("analyze_skillcheck.py")
     if not analyzer.exists():
+        log_path.write_text("analyze_skillcheck.py не найден.\n", encoding="utf-8")
         return
-    subprocess.run([sys.executable, str(analyzer), str(output)], cwd=str(analyzer.parent), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    result = subprocess.run(
+        [sys.executable, str(analyzer), str(output)],
+        cwd=str(analyzer.parent),
+        capture_output=True,
+        text=True,
+    )
+    text = result.stdout
+    if result.stderr:
+        text += ("\n" if text and not text.endswith("\n") else "") + result.stderr
+    if not text:
+        text = f"Анализатор завершился с кодом {result.returncode} без вывода.\n"
+    log_path.write_text(text, encoding="utf-8")
+    if result.returncode != 0:
+        raise RuntimeError(f"analyzer exit code {result.returncode}")
 
 
 def launch_finalizer(raw_video, events, output):
     session_dir = Path(tempfile.mkdtemp(prefix=f"violence_district_{output.stem}_"))
     events_path = session_dir / f"{output.stem}.events.json"
+    analysis_log = Path(f".analysis_{output.stem}.log")
+    analysis_log.write_text("Подготовка анализа...\n", encoding="utf-8")
     events_path.write_text(json.dumps(events, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
     return subprocess.Popen(
-        [sys.executable, str(Path(__file__).resolve()), "--finalize", "--raw", str(raw_video), "--events", str(events_path), "--output", str(output), "--session-dir", str(session_dir)],
+        [sys.executable, str(Path(__file__).resolve()), "--finalize", "--raw", str(raw_video), "--events", str(events_path), "--output", str(output), "--session-dir", str(session_dir), "--analysis-log", str(analysis_log)],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
-    )
+    ), analysis_log
+
+
+def print_analysis_log(name, analysis_log):
+    if not analysis_log.exists():
+        log(f"{name}: лог анализа не найден")
+        return
+    try:
+        text = analysis_log.read_text(encoding="utf-8")
+    except Exception as exc:
+        log(f"{name}: не удалось прочитать лог анализа: {exc}")
+        return
+    log(f"\n===== АНАЛИЗ {name} =====")
+    for line in text.rstrip().splitlines():
+        log(line)
+    log(f"===== КОНЕЦ АНАЛИЗА {name} =====\n")
+    analysis_log.unlink(missing_ok=True)
 
 
 def main():
@@ -323,21 +364,22 @@ def main():
     parser.add_argument("--events")
     parser.add_argument("--output")
     parser.add_argument("--session-dir")
+    parser.add_argument("--analysis-log")
     args = parser.parse_args()
 
     if args.worker:
         event_worker(args.device, args.start_time, args.log)
         return
     if args.finalize:
-        raise SystemExit(finalize_recording(Path(args.raw), Path(args.events), Path(args.output), Path(args.session_dir)))
+        raise SystemExit(finalize_recording(Path(args.raw), Path(args.events), Path(args.output), Path(args.session_dir), Path(args.analysis_log)))
 
-    print("=== Violence District DATA COLLECTOR ===\n")
-    print(f"Область: {REGION}")
-    print(f"FPS: {FPS}")
-    print("Зажми ЛКМ на генераторе, проходи skill-check через Space, отпусти ЛКМ.")
-    print("Каждый LMB DOWN получает уникальный номер. SPACE=0 не сохраняется.")
-    print("Анализ запускается отдельно для каждой сессии и не блокирует следующую запись.")
-    print("Ctrl+C — остановить collector. Уже запущенные анализы не прерываются.\n")
+    log("=== Violence District DATA COLLECTOR ===\n")
+    log(f"Область: {REGION}")
+    log(f"FPS: {FPS}")
+    log("Зажми ЛКМ на генераторе, проходи skill-check через Space, отпусти ЛКМ.")
+    log("Каждый LMB DOWN получает уникальный номер. SPACE=0 не сохраняется.")
+    log("Анализ запускается отдельно для каждой сессии и не блокирует следующую запись.")
+    log("Ctrl+C — остановить collector. Уже запущенные анализы не прерываются.\n")
     subprocess.run(["sudo", "-v"], check=True)
 
     event_root = Path(tempfile.mkdtemp(prefix="violence_district_events_"))
@@ -374,32 +416,39 @@ def main():
                     recorder = subprocess.Popen([
                         "gpu-screen-recorder", "-w", REGION, "-f", str(FPS), "-c", "mkv", "-o", str(raw_video)
                     ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-                    print(f"ЛКМ зажата → {output.stem}: запись")
+                    log(f"[{timestamp:8.3f}s] ЛКМ ЗАЖАТА → {output.stem}: запись началась")
                 elif recording:
                     session_events.append((timestamp, event))
-                    if event == "LMB_UP":
+                    if event == "SPACE_DOWN":
+                        count = sum(x[1] == "SPACE_DOWN" for x in session_events)
+                        log(f"[{timestamp - session_start:8.3f}s] {output.stem}: SPACE #{count}")
+                    elif event == "LMB_UP":
                         session_end = timestamp
+                        duration = session_end - session_start
+                        spaces = sum(x[1] == "SPACE_DOWN" for x in session_events)
                         stop_process(recorder, signal.SIGINT, 8)
                         recorder = None
                         recording = False
                         normalized = get_session_events(session_events, session_start, session_end)
-                        process = launch_finalizer(raw_video, normalized, output)
-                        finalizers[process] = output
-                        print(f"ЛКМ отпущена → {output.stem}: анализ в фоне")
+                        process, analysis_log = launch_finalizer(raw_video, normalized, output)
+                        finalizers[process] = (output, analysis_log, duration, spaces)
+                        log(f"[{session_end:8.3f}s] ЛКМ ОТПУЩЕНА → {output.stem}: запись {duration:.3f}s, SPACE={spaces}, анализ запущен в фоне")
                         session_start = None
                         session_events = []
                         output = None
                         raw_video = None
 
             finished = []
-            for process, name in finalizers.items():
+            for process, info in list(finalizers.items()):
                 if process.poll() is not None:
+                    name, analysis_log, duration, spaces = info
+                    print_analysis_log(name.stem, analysis_log)
                     if process.returncode == 0 and Path(name).exists():
-                        print(f"{name.stem}: ГОТОВО")
+                        log(f"{name.stem}: ГОТОВО | {duration:.3f}s | SPACE={spaces}")
                     elif process.returncode == 0:
-                        print(f"{name.stem}: SPACE не было, файл удалён")
+                        log(f"{name.stem}: SPACE не было, файл удалён")
                     else:
-                        print(f"{name.stem}: ошибка анализа")
+                        log(f"{name.stem}: ОШИБКА анализа (код {process.returncode})")
                     finished.append(process)
             for process in finished:
                 del finalizers[process]
