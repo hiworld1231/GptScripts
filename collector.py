@@ -74,10 +74,10 @@ def start_event_worker(device, start_time, event_log, error_log):
     error_file = open(error_log, "a", encoding="utf-8")
     process = subprocess.Popen(
         ["sudo", "-n", sys.executable, str(Path(__file__).resolve()), "--worker", "--device", device, "--start-time", str(start_time), "--log", str(event_log)],
-        stdin=subprocess.DEVNULL,
+        stdin=None,
         stdout=subprocess.DEVNULL,
         stderr=error_file,
-        start_new_session=True,
+        preexec_fn=os.setpgrp,
     )
     return process, error_file
 
@@ -345,66 +345,64 @@ def main():
                     raw_dir = Path(tempfile.mkdtemp(prefix=f"violence_district_capture_{output.stem}_"))
                     raw_video = raw_dir / f"capture_{output.stem}.mkv"
                     recorder = subprocess.Popen(["gpu-screen-recorder", "-w", REGION, "-f", str(FPS), "-c", "mkv", "-o", str(raw_video)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-                    log(f"[{timestamp:8.3f}s] ЛКМ ЗАЖАТА → {output.stem}: запись началась")
-                elif recording:
-                    session_events.append((timestamp, event))
+                    log(f"[{timestamp:8.3f}s] ЛКМ ЗАЖАТА → НАЧАЛО СБОРА: {output.name}")
+                    continue
+                if recording:
+                    relative = max(0.0, timestamp - session_start)
+                    session_events.append((relative, event))
                     if event == "SPACE_DOWN":
-                        count = sum(x[1] == "SPACE_DOWN" for x in session_events)
-                        log(f"[{timestamp - session_start:8.3f}s] {output.stem}: SPACE #{count}")
+                        count = sum(e == "SPACE_DOWN" for _, e in session_events)
+                        log(f"[{timestamp:8.3f}s] {output.name}: SPACE #{count} ({relative:.3f}s)")
                     elif event == "LMB_UP":
-                        session_end = timestamp
-                        duration = session_end - session_start
-                        spaces = sum(x[1] == "SPACE_DOWN" for x in session_events)
-                        stop_process(recorder, signal.SIGINT, 8)
+                        log(f"[{timestamp:8.3f}s] ЛКМ ОТПУЩЕНА → ЗАВЕРШЕНИЕ: {output.name}")
+                        stop_process(recorder, signal.SIGINT, timeout=10)
                         recorder = None
                         recording = False
-                        normalized = get_session_events(events, session_start, session_end)
-                        process, analysis_log = launch_finalizer(raw_video, normalized, output)
-                        finalizers[process] = (output, analysis_log, duration, spaces)
-                        log(f"[{session_end:8.3f}s] ЛКМ ОТПУЩЕНА → {output.stem}: запись {duration:.3f}s, SPACE={spaces}, анализ запущен в фоне")
+                        spaces = sum(e == "SPACE_DOWN" for _, e in session_events)
+                        if spaces == 0:
+                            raw_video.unlink(missing_ok=True)
+                            try:
+                                raw_video.parent.rmdir()
+                            except OSError:
+                                pass
+                            log(f"{output.name}: SPACE не нажимался → файл НЕ сохраняю")
+                        else:
+                            finalizer, analysis_log = launch_finalizer(raw_video, session_events, output)
+                            finalizers[output.name] = (finalizer, analysis_log)
+                            log(f"{output.name}: анализ запущен отдельно, SPACE={spaces}")
                         session_start = None
                         session_events = []
                         output = None
                         raw_video = None
-
+            for name, (process, analysis_log) in list(finalizers.items()):
+                if process.poll() is not None:
+                    print_analysis_log(name, analysis_log)
+                    del finalizers[name]
             if mouse_worker.poll() is not None and not STOP_REQUESTED:
-                mouse_error_file.flush()
                 log(f"Ввод: обработчик мыши завершился с кодом {mouse_worker.returncode}")
                 text = mouse_error.read_text(encoding="utf-8", errors="replace").strip()
                 if text:
                     log(text)
             if keyboard_worker.poll() is not None and not STOP_REQUESTED:
-                keyboard_error_file.flush()
                 log(f"Ввод: обработчик клавиатуры завершился с кодом {keyboard_worker.returncode}")
                 text = keyboard_error.read_text(encoding="utf-8", errors="replace").strip()
                 if text:
                     log(text)
-
-            finished = []
-            for process, info in list(finalizers.items()):
-                if process.poll() is not None:
-                    name, analysis_log, duration, spaces = info
-                    print_analysis_log(name.stem, analysis_log)
-                    if process.returncode == 0 and Path(name).exists():
-                        log(f"{name.stem}: ГОТОВО | {duration:.3f}s | SPACE={spaces}")
-                    elif process.returncode == 0:
-                        log(f"{name.stem}: SPACE не было, файл удалён")
-                    else:
-                        log(f"{name.stem}: ОШИБКА анализа (код {process.returncode})")
-                    finished.append(process)
-            for process in finished:
-                del finalizers[process]
             time.sleep(0.01)
     finally:
-        stop_process(recorder, signal.SIGINT, 5)
-        stop_process(mouse_worker, signal.SIGTERM, 3)
-        stop_process(keyboard_worker, signal.SIGTERM, 3)
+        if recorder is not None:
+            stop_process(recorder, signal.SIGINT, timeout=10)
+        stop_process(mouse_worker)
+        stop_process(keyboard_worker)
         mouse_error_file.close()
         keyboard_error_file.close()
         try:
+            for path in event_root.iterdir():
+                path.unlink(missing_ok=True)
             event_root.rmdir()
         except OSError:
             pass
+        log("Остановлено.")
 
 
 if __name__ == "__main__":
