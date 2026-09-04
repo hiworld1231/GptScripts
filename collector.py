@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import signal
 import subprocess
 import sys
@@ -21,6 +22,12 @@ RADIUS_MAX = 90
 SAMPLE_EVERY_N_FRAMES = 2
 START_CONFIRM = 3
 END_MISSES = 8
+STOP_REQUESTED = False
+
+
+def request_stop(signum, frame):
+    global STOP_REQUESTED
+    STOP_REQUESTED = True
 
 
 def next_output():
@@ -217,34 +224,27 @@ def analyze_output(output):
     if not analyzer.exists():
         print("Анализатор не найден: analyze_skillcheck.py")
         return
-    print("\n========== АВТОАНАЛИЗ ==========")
+    print(f"\n[{output.name}] АВТОАНАЛИЗ")
     result = subprocess.run([sys.executable, str(analyzer), str(output)], cwd=str(analyzer.parent))
     if result.returncode != 0:
-        print(f"Анализатор завершился с кодом {result.returncode}")
+        print(f"[{output.name}] Анализатор завершился с кодом {result.returncode}")
 
 
 def finalize_recording(raw_video, events_path, output):
-    events = []
     try:
         events_data = json.loads(Path(events_path).read_text(encoding="utf-8"))
         events = [(float(t), str(e)) for t, e in events_data]
     except Exception as exc:
         print(f"Ошибка чтения событий для {output.name}: {exc}")
-        try:
-            Path(raw_video).unlink()
-            Path(events_path).unlink()
-        except FileNotFoundError:
-            pass
+        Path(raw_video).unlink(missing_ok=True)
+        Path(events_path).unlink(missing_ok=True)
         return 1
 
     space_down = sum(event == "SPACE_DOWN" for _, event in events)
     if space_down == 0:
         print(f"{output.name}: SPACE не нажимался → файл НЕ сохраняю.")
-        try:
-            Path(raw_video).unlink()
-            Path(events_path).unlink()
-        except FileNotFoundError:
-            pass
+        Path(raw_video).unlink(missing_ok=True)
+        Path(events_path).unlink(missing_ok=True)
         return 0
 
     try:
@@ -289,6 +289,10 @@ def launch_finalizer(raw_video, events, output, temp_dir):
 
 
 def main():
+    global STOP_REQUESTED
+    signal.signal(signal.SIGINT, request_stop)
+    signal.signal(signal.SIGTERM, request_stop)
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--worker", action="store_true")
     parser.add_argument("--finalize", action="store_true")
@@ -315,6 +319,7 @@ def main():
     print("Каждый новый LMB DOWN создаёт отдельный session_XXXX.mkv.")
     print("Если SPACE не нажимался, сессия не сохраняется.")
     print("Анализ каждого завершённого файла работает отдельно и не блокирует следующую запись.\n")
+    print("Ctrl+C — остановить collector. Фоновые анализы продолжат работу.\n")
     print("Ожидаю ЛКМ...\n")
     subprocess.run(["sudo", "-v"], check=True)
 
@@ -332,12 +337,14 @@ def main():
         finalizers = []
 
         try:
-            while True:
+            while not STOP_REQUESTED:
                 events = parse_events(event_log)
                 new_events = events[handled_events:]
                 handled_events = len(events)
 
                 for timestamp, event in new_events:
+                    if STOP_REQUESTED:
+                        break
                     if event == "LMB_DOWN" and not recording:
                         recording = True
                         session_start = timestamp
@@ -349,7 +356,7 @@ def main():
                             stdin=subprocess.DEVNULL,
                             stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL,
-                            preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_IGN),
+                            start_new_session=True,
                         )
                         print(f"\nЛКМ зажата → НАЧАЛО СБОРА: {output.name}\n")
                     elif recording:
@@ -375,17 +382,14 @@ def main():
 
                 finalizers = [p for p in finalizers if p.poll() is None]
                 time.sleep(0.01)
-        except KeyboardInterrupt:
-            print("\nОстанавливаю запись...")
         finally:
+            if STOP_REQUESTED:
+                print("\nОстанавливаю collector...")
             stop_process(recorder, signal.SIGINT, 5)
             stop_process(mouse_worker, signal.SIGTERM, 2)
             stop_process(keyboard_worker, signal.SIGTERM, 2)
-            for process in finalizers:
-                try:
-                    process.wait(timeout=1)
-                except subprocess.TimeoutExpired:
-                    pass
+            if finalizers:
+                print(f"Фоновых анализов продолжают работу: {len(finalizers)}")
 
 
 if __name__ == "__main__":
